@@ -1,6 +1,6 @@
 [package]
 name = "sglaz"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "sglaz client agent — syncs environment variables with the sglaz server"
 
