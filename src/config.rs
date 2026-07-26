@@ -13,6 +13,17 @@ pub struct Binding {
     pub file_path: String,
 }
 
+/// One deployment (runnable service) this agent supervises. Persisted so the
+/// agent can report each service's state — and the version it last deployed —
+/// on every poll, even straight after a restart.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct DeployRecord {
+    pub deployment_id: String,
+    pub unit_name: String,
+    #[serde(default)]
+    pub version: String,
+}
+
 /// Persistent client configuration. One identity (token) per machine; the
 /// server drives the list of app bindings.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -24,6 +35,8 @@ pub struct Config {
     pub poll_interval_secs: u64,
     #[serde(default)]
     pub bindings: Vec<Binding>,
+    #[serde(default)]
+    pub deployments: Vec<DeployRecord>,
 }
 
 fn default_interval() -> u64 {

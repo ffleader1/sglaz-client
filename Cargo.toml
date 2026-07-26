@@ -16,6 +16,9 @@ serde_yaml = "0.9"
 directories = "5"
 gethostname = "0.5"
 anyhow = "1"
+# Archive ("folder"/Python release) extraction: GitHub source tarballs are .tar.gz.
+flate2 = "1"
+tar = "0.4"
 
 # Windows-only: system-tray UI + a hidden log console. The daemon runs headless
 # in the tray; the console is shown/hidden on demand and never kills the process.

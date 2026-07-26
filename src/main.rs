@@ -3,12 +3,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod config;
+mod deploy;
 mod envfile;
 #[cfg(windows)]
 mod tray;
 
 use anyhow::{bail, Context, Result};
-use config::{Binding, Config};
+use config::{Binding, Config, DeployRecord};
 use envfile::EnvVar;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -46,10 +47,22 @@ struct SnapshotReport {
 }
 
 #[derive(Serialize)]
+struct DeployReport {
+    #[serde(rename = "deploymentId")]
+    deployment_id: String,
+    state: String,
+    version: String,
+    error: String,
+}
+
+#[derive(Serialize)]
 struct PollReq {
     version: String,
     arch: String,
+    #[serde(rename = "serverUrl")]
+    server_url: String,
     snapshots: Vec<SnapshotReport>,
+    deployments: Vec<DeployReport>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +90,57 @@ struct BindingJob {
 struct Upgrade {
     version: String,
     url: String,
+}
+
+#[derive(Deserialize)]
+struct DeployJobIn {
+    action: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default, rename = "signedUrl")]
+    signed_url: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default, rename = "runCmd")]
+    run_cmd: String,
+    #[serde(default, rename = "prepareCmd")]
+    prepare_cmd: String,
+    #[serde(default, rename = "deployRoot")]
+    deploy_root: String,
+    #[serde(default, rename = "unitName")]
+    unit_name: String,
+    #[serde(default, rename = "envFile")]
+    env_file: String,
+    #[serde(default, rename = "envValues")]
+    env_values: Vec<EnvVar>,
+}
+
+#[derive(Deserialize)]
+struct DeploymentJobIn {
+    #[serde(rename = "deploymentId")]
+    deployment_id: String,
+    #[serde(default, rename = "unitName")]
+    unit_name: String,
+    #[serde(default)]
+    job: Option<DeployJobIn>,
+}
+
+#[derive(Deserialize)]
+struct LogReqIn {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    #[serde(default, rename = "unitName")]
+    unit_name: String,
+    #[serde(default)]
+    lines: u32,
+}
+
+#[derive(Serialize)]
+struct LogResultOut {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    text: String,
+    error: String,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +179,12 @@ struct PollResp {
     poll_interval_secs: u64,
     #[serde(default)]
     bindings: Vec<BindingJob>,
+    #[serde(default)]
+    deployments: Vec<DeploymentJobIn>,
+    #[serde(default)]
+    logs: Option<LogReqIn>,
+    #[serde(default, rename = "serverUrl")]
+    server_url: String,
     #[serde(default)]
     upgrade: Option<Upgrade>,
     #[serde(default)]
@@ -194,6 +264,7 @@ fn enroll(server: &str, code: &str) -> Result<()> {
         client_id: er.client_id,
         poll_interval_secs: er.poll_interval_secs.max(3),
         bindings: Vec::new(),
+        deployments: Vec::new(),
     };
     cfg.save()?;
 
@@ -235,13 +306,27 @@ fn poll_once(http: &reqwest::blocking::Client, cfg: &mut Config) -> Result<u64> 
         })
         .collect();
 
+    // Report each known deployment's live service state + running version.
+    let deploy_reports: Vec<DeployReport> = cfg
+        .deployments
+        .iter()
+        .map(|d| DeployReport {
+            deployment_id: d.deployment_id.clone(),
+            state: deploy::state(&d.unit_name),
+            version: d.version.clone(),
+            error: String::new(),
+        })
+        .collect();
+
     let resp = http
         .post(format!("{}/api/client/poll", cfg.server_url))
         .bearer_auth(&cfg.token)
         .json(&PollReq {
             version: VERSION.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            server_url: cfg.server_url.clone(),
             snapshots,
+            deployments: deploy_reports,
         })
         .send()
         .context("poll request failed")?;
@@ -272,6 +357,65 @@ fn poll_once(http: &reqwest::blocking::Client, cfg: &mut Config) -> Result<u64> 
                 println!("sglaz[{}]: wrote {} value(s) to {}", bj.app_name, job.values.len(), path);
             }
         }
+    }
+
+    // Apply deployment actions (deploy / restart / stop) and remember versions.
+    // deployed_versions carries a freshly-deployed version onto the persisted
+    // record so the next poll reports it.
+    let mut deployed_versions: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for dj in &pr.deployments {
+        let Some(job) = &dj.job else { continue };
+        match job.action.as_str() {
+            "deploy" => {
+                let spec = deploy::DeploySpec {
+                    version: job.version.clone(),
+                    signed_url: job.signed_url.clone(),
+                    kind: job.kind.clone(),
+                    run_cmd: job.run_cmd.clone(),
+                    prepare_cmd: job.prepare_cmd.clone(),
+                    deploy_root: job.deploy_root.clone(),
+                    unit_name: job.unit_name.clone(),
+                    env_file: job.env_file.clone(),
+                    env_values: job.env_values.clone(),
+                };
+                match deploy::deploy(http, &spec) {
+                    Ok(()) => {
+                        deployed_versions.insert(dj.deployment_id.clone(), job.version.clone());
+                    }
+                    Err(e) => eprintln!("sglaz: deploy {} failed: {:#}", dj.deployment_id, e),
+                }
+            }
+            "restart" => {
+                if let Err(e) = deploy::restart(&job.unit_name) {
+                    eprintln!("sglaz: restart {} failed: {:#}", dj.deployment_id, e);
+                }
+            }
+            "stop" => {
+                if let Err(e) = deploy::stop(&job.unit_name) {
+                    eprintln!("sglaz: stop {} failed: {:#}", dj.deployment_id, e);
+                }
+            }
+            other => eprintln!("sglaz: unknown deploy action {:?}", other),
+        }
+    }
+
+    // Answer a log request: fetch the unit's journal and post it back.
+    if let Some(lr) = &pr.logs {
+        let lines = if lr.lines == 0 { 200 } else { lr.lines };
+        let (text, error) = match deploy::logs(&lr.unit_name, lines) {
+            Ok(t) => (t, String::new()),
+            Err(e) => (String::new(), format!("{:#}", e)),
+        };
+        let _ = http
+            .post(format!("{}/api/client/log-result", cfg.server_url))
+            .bearer_auth(&cfg.token)
+            .json(&LogResultOut {
+                request_id: lr.request_id.clone(),
+                text,
+                error,
+            })
+            .send();
     }
 
     // Answer a file-browse request if the server asked. It may first ask us to
@@ -305,8 +449,44 @@ fn poll_once(http: &reqwest::blocking::Client, cfg: &mut Config) -> Result<u64> 
             file_path: bj.file_path.clone(),
         })
         .collect();
-    if bindings_differ(&cfg.bindings, &new_bindings) {
+    // Rebuild the deployment records from the server (authoritative), carrying
+    // over each one's known running version (or the just-deployed version).
+    let old_versions: std::collections::HashMap<&str, &str> = cfg
+        .deployments
+        .iter()
+        .map(|d| (d.deployment_id.as_str(), d.version.as_str()))
+        .collect();
+    let new_deployments: Vec<DeployRecord> = pr
+        .deployments
+        .iter()
+        .map(|dj| {
+            let version = deployed_versions
+                .get(&dj.deployment_id)
+                .cloned()
+                .or_else(|| old_versions.get(dj.deployment_id.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            DeployRecord {
+                deployment_id: dj.deployment_id.clone(),
+                unit_name: dj.unit_name.clone(),
+                version,
+            }
+        })
+        .collect();
+
+    let bindings_changed = bindings_differ(&cfg.bindings, &new_bindings);
+    let deployments_changed = deployments_differ(&cfg.deployments, &new_deployments);
+    if bindings_changed || deployments_changed || !deployed_versions.is_empty() {
         cfg.bindings = new_bindings;
+        cfg.deployments = new_deployments;
+        cfg.save().ok();
+    }
+
+    // Adopt a server-pushed base-URL switch. Both URLs must point at the same
+    // server (token stays valid); the next poll goes to the new URL.
+    let new_url = pr.server_url.trim().trim_end_matches('/').to_string();
+    if !new_url.is_empty() && new_url != cfg.server_url {
+        println!("sglaz: switching server URL {} -> {}", cfg.server_url, new_url);
+        cfg.server_url = new_url;
         cfg.save().ok();
     }
 
@@ -430,6 +610,21 @@ fn bindings_differ(a: &[Binding], b: &[Binding]) -> bool {
     }
     for (x, y) in a.iter().zip(b.iter()) {
         if x.binding_id != y.binding_id || x.file_path != y.file_path {
+            return true;
+        }
+    }
+    false
+}
+
+fn deployments_differ(a: &[DeployRecord], b: &[DeployRecord]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.deployment_id != y.deployment_id
+            || x.unit_name != y.unit_name
+            || x.version != y.version
+        {
             return true;
         }
     }
