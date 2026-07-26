@@ -113,6 +113,16 @@ struct DeployJobIn {
     env_file: String,
     #[serde(default, rename = "envValues")]
     env_values: Vec<EnvVar>,
+    #[serde(default, rename = "secretFiles")]
+    secret_files: Vec<SecretFileIn>,
+}
+
+#[derive(Deserialize)]
+struct SecretFileIn {
+    #[serde(default)]
+    filename: String,
+    #[serde(default)]
+    content: String, // base64
 }
 
 #[derive(Deserialize)]
@@ -378,6 +388,14 @@ fn poll_once(http: &reqwest::blocking::Client, cfg: &mut Config) -> Result<u64> 
                     unit_name: job.unit_name.clone(),
                     env_file: job.env_file.clone(),
                     env_values: job.env_values.clone(),
+                    secret_files: job
+                        .secret_files
+                        .iter()
+                        .map(|f| deploy::SecretFile {
+                            filename: f.filename.clone(),
+                            content_b64: f.content.clone(),
+                        })
+                        .collect(),
                 };
                 match deploy::deploy(http, &spec) {
                     Ok(()) => {

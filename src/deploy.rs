@@ -27,6 +27,14 @@ pub struct DeploySpec {
     pub unit_name: String,
     pub env_file: String, // absolute path; systemd loads it into the process
     pub env_values: Vec<EnvVar>,
+    pub secret_files: Vec<SecretFile>,
+}
+
+/// A credential file to drop into <root>/shared before start. content_b64 is the
+/// file's bytes, base64-encoded (they can be binary / multi-line).
+pub struct SecretFile {
+    pub filename: String,
+    pub content_b64: String,
 }
 
 /// Download, place, and (re)start a release. Returns on success; the caller
@@ -68,6 +76,24 @@ pub fn deploy(http: &reqwest::blocking::Client, spec: &DeploySpec) -> Result<()>
     if !spec.env_values.is_empty() && !spec.env_file.trim().is_empty() {
         crate::envfile::write(&spec.env_file, &spec.env_values)
             .with_context(|| format!("writing env file {}", spec.env_file))?;
+    }
+
+    // 2c. Write credential files into shared/ with mode 0600. They live beside
+    // the .env (not in the versioned release dir) so their path is stable across
+    // deploys and an env value can point at it.
+    let shared = root.join("shared");
+    for sf in &spec.secret_files {
+        let name = sanitize_filename(&sf.filename);
+        if name.is_empty() {
+            eprintln!("sglaz-deploy[{}]: skipping secret file with empty/invalid name", spec.unit_name);
+            continue;
+        }
+        let bytes = base64_decode(&sf.content_b64)
+            .with_context(|| format!("decoding secret file {name}"))?;
+        let dest = shared.join(&name);
+        std::fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
+        set_file_mode(&dest, 0o600)?;
+        println!("sglaz-deploy[{}]: wrote credential file {}", spec.unit_name, dest.display());
     }
 
     // 3. Optional prepare step (e.g. `pip install -r requirements.txt`).
@@ -227,13 +253,61 @@ fn symlink_swap(target: &Path, link: &Path) -> Result<()> {
 }
 
 fn set_executable(path: &Path) -> Result<()> {
+    set_file_mode(path, 0o755)
+}
+
+/// Set a file's unix permission bits (no-op on non-unix).
+fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("chmod +x {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
+}
+
+/// Reduce a server-supplied name to a safe bare filename: strip any path parts
+/// and reject traversal, so a credential file can only ever land in shared/.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return String::new();
+    }
+    base.to_string()
+}
+
+/// Decode standard base64 (with optional padding). Self-contained so the agent
+/// pulls in no extra crate for the occasional credential file.
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue; // padding / newlines
+        }
+        let v = val(c).ok_or_else(|| anyhow::anyhow!("invalid base64 character"))?;
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// Extract a .tar.gz into `dest`, stripping the single top-level directory that
